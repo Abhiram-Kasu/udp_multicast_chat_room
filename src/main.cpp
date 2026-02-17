@@ -1,11 +1,9 @@
 #include "server.hpp"
 #include <print>
 
-#include <boost/asio.hpp>
-
 auto main() -> int {
 
-  auto server = Server{};
+  auto server = Server{4040, 10};
 
   server.serve();
 }

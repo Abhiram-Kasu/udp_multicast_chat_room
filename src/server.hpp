@@ -1,17 +1,45 @@
 #pragma once
+#include "udp_server.hpp"
 #include <boost/asio.hpp>
+#include <boost/asio/experimental/channel.hpp>
+#include <boost/json/parse.hpp>
 #include <cstdint>
+#include <mutex>
 
+using boost::asio::ip::tcp;
 using boost::asio::ip::udp;
+
+template <typename Message>
+using Channel = boost::asio::experimental::channel<void(
+    boost::system::error_code, Message)>;
+
+struct TCPChatRoom {
+  std::mutex mutex;
+  std::vector<Channel<std::string>> connections;
+  uint64_t id;
+};
+
 struct Server {
 private:
   int m_listening_address;
   uint32_t m_max_room_limit;
   boost::asio::io_context m_io_context;
 
+  tcp::acceptor m_tcp_server_acceptor;
+  std::optional<UDP_Server> m_udp_server;
+
+  std::vector<TCPChatRoom> chatRooms;
+
 public:
-  Server(int address, uint32_t max_room_limit);
+  Server(int address, uint64_t max_room_limit);
+
   ~Server();
 
   void serve();
+
+private:
+  static boost::asio::awaitable<std::vector<char>> parse_data(tcp::socket &s);
+  boost::asio::awaitable<void> accept_connections();
+  boost::asio::awaitable<void> tcp_accept(boost::asio::ip::tcp::socket s);
+  void init_udp_server() {}
 };
