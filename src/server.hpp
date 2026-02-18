@@ -14,6 +14,10 @@
 using boost::asio::ip::tcp;
 using boost::asio::ip::udp;
 
+template <class... Ts> struct overloads : Ts... {
+  using Ts::operator()...;
+};
+
 template <typename Message>
 using Channel = boost::asio::experimental::channel<void(
     boost::system::error_code, Message)>;
@@ -43,6 +47,9 @@ public:
   void serve();
 
 private:
+  boost::asio::awaitable<
+      std::variant<std::shared_ptr<Channel<std::string>>, std::string_view>>
+  handle_sub(boost::json::object &);
   static boost::asio::awaitable<std::vector<char>> parse_data(tcp::socket &s);
   boost::asio::awaitable<void> accept_connections();
   boost::asio::awaitable<void> tcp_accept(boost::asio::ip::tcp::socket s);

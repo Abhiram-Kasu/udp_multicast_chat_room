@@ -3,6 +3,8 @@
 #include <format>
 #include <mutex>
 #include <ranges>
+#include <string>
+#include <variant>
 
 Server::Server(int address, uint64_t max_room_limit)
     : m_listening_address(address), m_max_room_limit(max_room_limit),
@@ -59,34 +61,28 @@ Server::tcp_accept(boost::asio::ip::tcp::socket s) {
         // if the type
         auto &value = type.value();
         if (value == "sub") {
-          // get code of the subbed group
-          if (auto grp = (structured_data.contains("grp"),
-                          structured_data.at("grp").as_uint64())) {
-
-            if (auto chat_room = std::find_if(
-                    chatRooms.begin(), chatRooms.end(),
-                    [&](const auto &room) { return room.id == grp; });
-                chat_room != chatRooms.end()) {
-              auto &chat_room_v = *chat_room;
-              auto channel = make_shared<Channel<std::string>>(m_io_context);
-              boost::asio::co_spawn(
-                  m_io_context,
-                  [&]() -> boost::asio::awaitable<void> {
-                    while (channel->is_open()) {
-
-                      auto data = co_await channel->async_receive();
-
-                      auto json_str =
-                          boost::json::serialize(boost::json::object{
-                              {"type", "message"}, {"data", data}});
-                      co_await s.async_send(boost::asio::buffer(json_str));
-                    }
-                  },
-                  boost::asio::detached);
-              auto gaurd = std::lock_guard(chat_room_v.mutex);
-              chat_room_v.connections.push_back(channel);
-            }
-          }
+          std::visit(
+              overloads{[&](auto channel) {
+                          boost::asio::co_spawn(
+                              m_io_context,
+                              [&]() -> boost::asio::awaitable<void> {
+                                while (channel->is_open() and s.is_open()) {
+                                  auto data = co_await channel->async_receive();
+                                  auto json_str = boost::json::serialize(
+                                      boost::json::object{{"type", "message"},
+                                                          {"data", data}});
+                                  co_await s.async_send(
+                                      boost::asio::buffer(json_str));
+                                }
+                              },
+                              boost::asio::detached);
+                        },
+                        [&](std::string_view error) {
+                          s.async_send(boost::asio::buffer(std::format(
+                                           "Failed to parse: {}", error)),
+                                       boost::asio::detached);
+                        }},
+              co_await handle_sub(structured_data));
 
         } else if (value == "desub") {
 
@@ -97,4 +93,28 @@ Server::tcp_accept(boost::asio::ip::tcp::socket s) {
       }
     }
   }
+}
+
+boost::asio::awaitable<
+    std::variant<std::shared_ptr<Channel<std::string>>, std::string_view>>
+Server::handle_sub(boost::json::object &structured_data) {
+  // get code of the subbed group
+  if (auto grp = (structured_data.contains("grp"),
+                  structured_data.at("grp").as_uint64())) {
+
+    if (auto chat_room =
+            std::find_if(chatRooms.begin(), chatRooms.end(),
+                         [&](const auto &room) { return room.id == grp; });
+        chat_room != chatRooms.end()) {
+      auto &chat_room_v = *chat_room;
+      auto channel = make_shared<Channel<std::string>>(m_io_context);
+
+      auto gaurd = std::lock_guard(chat_room_v.mutex);
+      chat_room_v.connections.push_back(channel);
+      co_return channel;
+    } else {
+      co_return "No such group exists";
+    }
+  }
+  co_return "No 'grp' provided";
 }
