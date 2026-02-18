@@ -2,8 +2,13 @@
 #include "udp_server.hpp"
 #include <boost/asio.hpp>
 #include <boost/asio/experimental/channel.hpp>
+
+#include <boost/json/object.hpp>
 #include <boost/json/parse.hpp>
+#include <boost/json/serialize.hpp>
 #include <cstdint>
+#include <list>
+#include <memory>
 #include <mutex>
 
 using boost::asio::ip::tcp;
@@ -15,7 +20,7 @@ using Channel = boost::asio::experimental::channel<void(
 
 struct TCPChatRoom {
   std::mutex mutex;
-  std::vector<Channel<std::string>> connections;
+  std::vector<std::weak_ptr<Channel<std::string>>> connections;
   uint64_t id;
 };
 
@@ -28,7 +33,7 @@ private:
   tcp::acceptor m_tcp_server_acceptor;
   std::optional<UDP_Server> m_udp_server;
 
-  std::vector<TCPChatRoom> chatRooms;
+  std::list<TCPChatRoom> chatRooms;
 
 public:
   Server(int address, uint64_t max_room_limit);

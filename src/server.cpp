@@ -1,4 +1,8 @@
 #include "server.hpp"
+#include <boost/json/src.hpp>
+#include <format>
+#include <mutex>
+#include <ranges>
 
 Server::Server(int address, uint64_t max_room_limit)
     : m_listening_address(address), m_max_room_limit(max_room_limit),
@@ -56,6 +60,33 @@ Server::tcp_accept(boost::asio::ip::tcp::socket s) {
         auto &value = type.value();
         if (value == "sub") {
           // get code of the subbed group
+          if (auto grp = (structured_data.contains("grp"),
+                          structured_data.at("grp").as_uint64())) {
+
+            if (auto chat_room = std::find_if(
+                    chatRooms.begin(), chatRooms.end(),
+                    [&](const auto &room) { return room.id == grp; });
+                chat_room != chatRooms.end()) {
+              auto &chat_room_v = *chat_room;
+              auto channel = make_shared<Channel<std::string>>(m_io_context);
+              boost::asio::co_spawn(
+                  m_io_context,
+                  [&]() -> boost::asio::awaitable<void> {
+                    while (channel->is_open()) {
+
+                      auto data = co_await channel->async_receive();
+
+                      auto json_str =
+                          boost::json::serialize(boost::json::object{
+                              {"type", "message"}, {"data", data}});
+                      co_await s.async_send(boost::asio::buffer(json_str));
+                    }
+                  },
+                  boost::asio::detached);
+              auto gaurd = std::lock_guard(chat_room_v.mutex);
+              chat_room_v.connections.push_back(channel);
+            }
+          }
 
         } else if (value == "desub") {
 
