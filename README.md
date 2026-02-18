@@ -18,7 +18,7 @@ The system accepts the trade-off of reduced reliability (UDP's connectionless na
 
 ## Current Implementation Status
 
-### ✅ Completed Features
+### Completed Features
 
 1. **TCP-based Server Infrastructure**
    - TCP acceptor running on port 4040 (configurable)
@@ -45,7 +45,7 @@ The system accepts the trade-off of reduced reliability (UDP's connectionless na
    - Non-blocking send operations
    - Automatic cleanup of disconnected clients (weak_ptr management)
 
-### 🚧 In Progress
+### In Progress
 
 1. **UDP Multicast Infrastructure**
    - UDP_Server class defined but not yet implemented
@@ -256,24 +256,5 @@ This project deliberately uses a **custom protocol over raw sockets** rather tha
 2. **Control**: Full control over message framing and protocol semantics
 3. **Multicast Ready**: Easier integration with UDP multicast (no WebSocket overhead)
 4. **Learning**: Educational value in understanding low-level networking
-
-## Contributing
-
-Contributions are welcome! Areas of focus:
-- UDP multicast implementation
-- Authentication system design
-- QUIC protocol integration
-- Performance optimizations
-- Documentation improvements
-
-## License
-
-[Specify your license here]
-
-## Author
-
-Abhiram Kasu
-
----
 
 **Note**: This is an active development project. The UDP multicast functionality is the next major milestone.
