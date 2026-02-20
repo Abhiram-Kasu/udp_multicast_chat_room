@@ -30,7 +30,7 @@ struct TCPChatRoom {
 
 struct Server {
 private:
-  int m_listening_address;
+  int m_listening_port;
   uint32_t m_max_room_limit;
   boost::asio::io_context m_io_context;
 

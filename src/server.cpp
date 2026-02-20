@@ -1,120 +1,156 @@
 #include "server.hpp"
+#include <__ostream/print.h>
 #include <boost/json/src.hpp>
 #include <format>
 #include <mutex>
 #include <ranges>
 #include <string>
+#include <string_view>
 #include <variant>
 
 Server::Server(int address, uint64_t max_room_limit)
-    : m_listening_address(address), m_max_room_limit(max_room_limit),
+    : m_listening_port(address), m_max_room_limit(max_room_limit),
       m_tcp_server_acceptor(boost::asio::ip::tcp::acceptor{
           m_io_context, boost::asio::ip::tcp::endpoint(
-                            boost::asio::ip::tcp::v4(), m_listening_address)}) {
-
+              boost::asio::ip::tcp::v4(), m_listening_port)
+      }) {
 }
 
 Server::~Server() = default;
 
 void Server::serve() {
-  boost::asio::co_spawn(m_io_context, accept_connections(),
-                        boost::asio::detached);
-  m_io_context.run();
+    boost::asio::co_spawn(m_io_context, accept_connections(),
+                          boost::asio::detached);
+    std::println("listening on {}", m_listening_port);
+    m_io_context.run();
 }
 
 boost::asio::awaitable<void> Server::accept_connections() {
-  for (;;) {
-    auto socket =
-        co_await m_tcp_server_acceptor.async_accept(boost::asio::use_awaitable);
-    co_await tcp_accept(std::move(socket));
-  }
+    for (;;) {
+        auto socket =
+                co_await m_tcp_server_acceptor.async_accept(boost::asio::use_awaitable);
+        std::println("Received Connection");
+        co_await tcp_accept(std::move(socket));
+    }
 }
 
-boost::asio::awaitable<std::vector<char>> Server::parse_data(tcp::socket &s) {
+boost::asio::awaitable<std::vector<char> > Server::parse_data(tcp::socket &s) {
+    auto mutable_buffer = boost::asio::streambuf();
 
-  auto mutable_buffer = boost::asio::streambuf();
+    auto bytes_read = co_await boost::asio::async_read_until(
+        s, mutable_buffer, '\n', boost::asio::use_awaitable);
 
-  auto bytes_read = co_await boost::asio::async_read_until(
-      s, mutable_buffer, ' ', boost::asio::use_awaitable);
+    std::istream response_stream(&mutable_buffer);
+    std::string data_str(bytes_read, '\0');
+    response_stream.read(data_str.data(), bytes_read);
 
-  std::istream response_stream(&mutable_buffer);
-  uint64_t data_size;
-  response_stream >> data_size;
+    if (!data_str.empty() && data_str.back() == '\n') {
+        data_str.pop_back();
+    }
 
-  std::vector<char> data(data_size);
-  co_await s.async_read_some(boost::asio::buffer(data));
-  co_return data;
+    std::vector<char> data(data_str.begin(), data_str.end());
+    co_return data;
 }
 
 boost::asio::awaitable<void>
 Server::tcp_accept(boost::asio::ip::tcp::socket s) {
-  // parse the first n bytes until the first space to see how much data is
-  // incoming
-  for (;;) {
-    const auto data = co_await parse_data(s);
-    std::string_view data_str{data.begin(), data.end()};
-    boost::system::error_code error_code;
-    auto structured_data = boost::json::parse(data_str, error_code).as_object();
+    // parse until the newline delimiter to read a complete JSON message
+    // incoming
+    for (;;) {
+        const auto data = co_await parse_data(s);
+        std::println("Got data: {}", std::string_view{data.begin(), data.end()});
+        std::string_view data_str{data.begin(), data.end()};
+        boost::system::error_code error_code;
+        auto structured_data = boost::json::parse(data_str, error_code).as_object();
 
-    if (structured_data.contains("type")) {
-      if (auto type = structured_data.at("type").try_as_string()) {
-        // if the type
-        auto &value = type.value();
-        if (value == "sub") {
-          std::visit(
-              overloads{[&](auto channel) {
-                          boost::asio::co_spawn(
-                              m_io_context,
-                              [&]() -> boost::asio::awaitable<void> {
-                                while (channel->is_open() and s.is_open()) {
-                                  auto data = co_await channel->async_receive();
-                                  auto json_str = boost::json::serialize(
-                                      boost::json::object{{"type", "message"},
-                                                          {"data", data}});
-                                  co_await s.async_send(
-                                      boost::asio::buffer(json_str));
-                                }
-                              },
-                              boost::asio::detached);
-                        },
-                        [&](std::string_view error) {
-                          s.async_send(boost::asio::buffer(std::format(
-                                           "Failed to parse: {}", error)),
-                                       boost::asio::detached);
-                        }},
-              co_await handle_sub(structured_data));
-
-        } else if (value == "desub") {
-
-          co_return;
-
-        } else [[likely]] if (value == "message") {
+        if (error_code.failed()) {
+            std::println("Failed to parse JSON: {}", error_code.message());
+            co_await s.async_send(
+                boost::asio::buffer("Failed to parse JSON: " + error_code.message()));
         }
-      }
+        if (structured_data.contains("type")) {
+            if (auto type = structured_data.at("type").try_as_string()) {
+                // if the type
+                const std::string &value = type.value().c_str();
+                if (value == "sub") {
+                    std::println("Found sub type, handling...");
+                    std::visit(
+                        overloads{
+                            [&](std::shared_ptr<Channel<std::string> > channel) {
+                                boost::asio::co_spawn(
+                                    m_io_context,
+                                    [&]() -> boost::asio::awaitable<void> {
+                                        while (channel->is_open() and s.is_open()) {
+                                            auto data = co_await channel->async_receive();
+                                            auto json_str = boost::json::serialize(
+                                                boost::json::object{
+                                                    {"type", "message"},
+                                                    {"data", data}
+                                                });
+                                            co_await s.async_send(
+                                                boost::asio::buffer(json_str));
+                                        }
+                                    },
+                                    boost::asio::detached);
+                            },
+                            [&](std::string_view error) {
+                                s.async_send(boost::asio::buffer(std::format(
+                                                 "Failed: {}", error)),
+                                             boost::asio::detached);
+                            }
+                        },
+                        co_await handle_sub(structured_data));
+                } else if (value == "desub") {
+                    co_return;
+                } else [[likely]] if (value == "message") {
+                } else {
+                    std::println("Invalid JSON");
+                    co_await s.async_send(boost::asio::buffer("Invalid JSON"));
+                }
+            }
+        }
     }
-  }
 }
 
 boost::asio::awaitable<
-    std::variant<std::shared_ptr<Channel<std::string>>, std::string_view>>
+    std::variant<std::shared_ptr<Channel<std::string> >, std::string_view> >
 Server::handle_sub(boost::json::object &structured_data) {
-  // get code of the subbed group
-  if (auto grp = (structured_data.contains("grp"),
-                  structured_data.at("grp").as_uint64())) {
+    // get code of the subbed group
+    if (not structured_data.contains("grp")) {
+        co_return "grp not found";
+    }
+
+
+    const auto grp_res = [&] -> std::optional<uint64_t> {
+        if (auto grp_result_uint64_t = structured_data.at("grp").try_as_uint64()) {
+            return *grp_result_uint64_t;
+        }
+        if (auto grp_result_int64_t = structured_data.at("grp").try_as_int64()) {
+            return static_cast<uint64_t>(*grp_result_int64_t);
+        }
+
+        return std::optional<uint64_t>{};
+    }();
+
+    if (not grp_res) {
+        co_return "grp not valid";
+    }
+    auto grp = *grp_res;
+
 
     if (auto chat_room =
-            std::find_if(chatRooms.begin(), chatRooms.end(),
-                         [&](const auto &room) { return room.id == grp; });
+                std::ranges::find_if(chatRooms,
+                                     [&](const auto &room) { return room.id == grp; });
         chat_room != chatRooms.end()) {
-      auto &chat_room_v = *chat_room;
-      auto channel = make_shared<Channel<std::string>>(m_io_context);
+        auto &chat_room_v = *chat_room;
+        auto channel = make_shared<Channel<std::string> >(m_io_context);
 
-      auto gaurd = std::lock_guard(chat_room_v.mutex);
-      chat_room_v.connections.push_back(channel);
-      co_return channel;
+        auto _ = std::lock_guard(chat_room_v.mutex);
+        chat_room_v.connections.push_back(channel);
+        co_return channel;
     } else {
-      co_return "No such group exists";
+        co_return "No such group exists";
     }
-  }
-  co_return "No 'grp' provided";
+
+    co_return "No 'grp' provided";
 }
