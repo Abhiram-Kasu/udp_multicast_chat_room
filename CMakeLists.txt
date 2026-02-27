@@ -15,6 +15,7 @@ set(SRC_LIST
 
 add_executable(udp_multicast_chat_room ${SRC_LIST})
 
-target_include_directories(udp_multicast_chat_room PRIVATE /opt/homebrew/include)
-target_link_directories(udp_multicast_chat_room PRIVATE /opt/homebrew/lib)
-target_link_libraries(udp_multicast_chat_room PRIVATE boost_json)
+target_include_directories(udp_multicast_chat_room PRIVATE /usr/local/boost/include)
+target_link_directories(udp_multicast_chat_room PRIVATE /usr/local/boost/lib)
+target_link_libraries(udp_multicast_chat_room PRIVATE boost_json boost_cobalt)
+target_compile_definitions(udp_multicast_chat_room PRIVATE BOOST_ERROR_CODE_HEADER_ONLY=1)

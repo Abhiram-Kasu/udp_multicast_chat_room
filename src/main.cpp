@@ -1,9 +1,9 @@
 #include "server.hpp"
-#include <print>
+#include <boost/cobalt/main.hpp>
 
-auto main() -> int {
-
+boost::cobalt::main co_main(int argc, char **argv) {
   auto server = Server{4040, 10};
 
-  server.serve();
+  co_await server.serve();
+  co_return 0;
 }
