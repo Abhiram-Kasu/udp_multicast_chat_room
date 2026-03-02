@@ -10,6 +10,7 @@
 #include <boost/json/serialize.hpp>
 #include <cstdint>
 #include <list>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -54,14 +55,23 @@ public:
   boost::cobalt::promise<void> serve();
 
 private:
-  boost::cobalt::promise<
-      std::variant<std::shared_ptr<Channel<std::string>>, std::string_view>>
-  handle_sub(boost::json::object &);
-  std::optional<std::shared_ptr<Channel<std::string>>>
-  try_sub_to_room(uint64_t room_id);
+  boost::cobalt::promise<std::variant<
+      std::pair<std::shared_ptr<Channel<std::string>>, TCPChatRoom *>,
+      std::string_view>>
+  handle_sub(boost::json::object &,
+             const std::map<TCPChatRoom *, boost::cobalt::promise<void>>
+                 &listener_map);
+  std::shared_ptr<Channel<std::string>> sub_to_room(TCPChatRoom &room_id);
 
-  boost::cobalt::promise<
-      std::variant<std::shared_ptr<Channel<std::string>>, std::string_view>>
+  boost::cobalt::promise<void>
+  spawn_listener(tcp_socket &socket, std::weak_ptr<Channel<std::string>> chan,
+                 TCPChatRoom *chat_room);
+
+  std::optional<TCPChatRoom *> try_find_room(uint64_t room_id);
+
+  boost::cobalt::promise<std::variant<
+      std::pair<std::shared_ptr<Channel<std::string>>, TCPChatRoom *>,
+      std::string_view>>
   handle_create_and_sub(boost::json::object &);
   static boost::cobalt::promise<std::vector<char>> parse_data(tcp_socket &s);
   boost::cobalt::promise<void> accept_connections();
