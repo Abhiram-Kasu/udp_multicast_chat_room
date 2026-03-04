@@ -75,12 +75,19 @@ boost::cobalt::promise<void> Server::accept_connections() {
     co_return;
   }
   auto &acceptor = *m_tcp_server_acceptor;
+  std::list<boost::cobalt::promise<void>> sessions;
   for (;;) {
     std::println("accept_connections: waiting for connection");
     try {
+      // clean up finished sessions
+      sessions.remove_if(
+          [](boost::cobalt::promise<void> &p) { return p.ready(); });
+
       auto socket = co_await acceptor.async_accept();
-      std::println("accept_connections: received connection");
-      co_await tcp_accept(std::move(socket));
+      std::println(
+          "accept_connections: received connection (total active sessions: {})",
+          sessions.size() + 1);
+      sessions.push_back(tcp_accept(std::move(socket)));
     } catch (const boost::system::system_error &err) {
       std::println("accept_connections: accept error: {}", err.what());
       co_return;
@@ -94,16 +101,35 @@ boost::cobalt::promise<std::vector<char>> Server::parse_data(tcp_socket &s) {
 
   auto bytes_read = co_await boost::asio::async_read_until(
       s, mutable_buffer, '\n', boost::cobalt::use_op);
-  std::println("parse_data: read {} bytes", bytes_read);
+  std::println("parse_data: read {} bytes, streambuf size = {}", bytes_read,
+               mutable_buffer.size());
 
   std::istream response_stream(&mutable_buffer);
   std::string data_str(bytes_read, '\0');
   response_stream.read(data_str.data(), bytes_read);
 
-  if (!data_str.empty() && data_str.back() == '\n') {
-    data_str.pop_back();
-    std::println("parse_data: trimmed trailing newline");
+  // hex dump of raw bytes before trimming
+  std::print("parse_data: raw hex dump ({} bytes): ", data_str.size());
+  for (unsigned char c : data_str) {
+    std::print("{:02x} ", c);
   }
+  std::println("");
+  std::println("parse_data: raw string repr: [{}]", data_str);
+
+  while (!data_str.empty() &&
+         (data_str.back() == '\n' || data_str.back() == '\r')) {
+    std::println("parse_data: trimming trailing byte 0x{:02x}",
+                 static_cast<unsigned char>(data_str.back()));
+    data_str.pop_back();
+  }
+
+  // hex dump after trimming
+  std::print("parse_data: trimmed hex dump ({} bytes): ", data_str.size());
+  for (unsigned char c : data_str) {
+    std::print("{:02x} ", c);
+  }
+  std::println("");
+  std::println("parse_data: trimmed string repr: [{}]", data_str);
 
   std::vector<char> data(data_str.begin(), data_str.end());
   std::println("parse_data: returning {} bytes", data.size());
@@ -129,11 +155,21 @@ boost::cobalt::promise<void> Server::tcp_accept(tcp_socket s) {
       }
 
       std::string_view data_str{data.begin(), data.end()};
+
+      // hex dump of what we're about to parse
+      std::print("tcp_accept: about to parse JSON hex ({} bytes): ",
+                 data_str.size());
+      for (unsigned char c : data_str) {
+        std::print("{:02x} ", c);
+      }
+      std::println("");
+      std::println("tcp_accept: about to parse JSON string: [{}]", data_str);
+
       boost::system::error_code error_code;
       auto parsed = boost::json::parse(data_str, error_code);
       if (error_code.failed()) {
-        std::println("tcp_accept: failed to parse JSON: {}",
-                     error_code.message());
+        std::println("tcp_accept: failed to parse JSON: {} (error code: {})",
+                     error_code.message(), error_code.value());
         co_await s.async_send(boost::asio::buffer("Failed to parse JSON: " +
                                                   error_code.message()));
         continue;
@@ -209,7 +245,7 @@ boost::cobalt::promise<void> Server::tcp_accept(tcp_socket s) {
                     }},
                 co_await handle_create_and_sub(structured_data));
 
-          } else [[likely]] if (value == "message") {
+          } else [[likely]] if (value == "msg") {
             std::println("tcp_accept: handling message request");
             co_await std::visit(
                 overloads{
@@ -285,10 +321,16 @@ boost::cobalt::promise<void> Server::tcp_accept(tcp_socket s) {
         co_await s.async_send(boost::asio::buffer("Invalid JSON"));
       }
     } catch (const boost::system::system_error &err) {
-      std::println("tcp_accept: system_error: {}", err.what());
+      if (err.code() == boost::asio::error::eof ||
+          err.code() == boost::asio::error::connection_reset ||
+          err.code() == boost::asio::error::broken_pipe) {
+        std::println("tcp_accept: client disconnected");
+      } else {
+        std::println("tcp_accept: error: {}", err.code().message());
+      }
       co_return;
     } catch (const std::exception &err) {
-      std::println("tcp_accept: exception: {}", err.what());
+      std::println("tcp_accept: unexpected error: {}", err.what());
       co_return;
     }
   }
@@ -406,10 +448,22 @@ Server::spawn_listener(tcp_socket &socket,
           {"type", "message"}, {"data", data}, {"grp_name", chat_room->name}});
       co_await socket.async_send(boost::asio::buffer(json_str));
     } catch (const boost::system::system_error &err) {
-      std::println("spawn_listener: system_error: {}", err.what());
+      if (err.code() == boost::asio::error::eof ||
+          err.code() == boost::asio::error::connection_reset ||
+          err.code() == boost::asio::error::broken_pipe ||
+          err.code() == boost::asio::error::operation_aborted ||
+          err.code().value() == 89 /* ECANCELED */) {
+        std::println("spawn_listener: client left room id={} name={}",
+                     chat_room->id, chat_room->name);
+      } else {
+        std::println("spawn_listener: error for room id={} name={}: {}",
+                     chat_room->id, chat_room->name, err.code().message());
+      }
       break;
     } catch (const std::exception &err) {
-      std::println("spawn_listener: exception: {}", err.what());
+      std::println(
+          "spawn_listener: unexpected error for room id={} name={}: {}",
+          chat_room->id, chat_room->name, err.what());
       break;
     }
   }
