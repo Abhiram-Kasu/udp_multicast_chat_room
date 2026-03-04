@@ -1,5 +1,11 @@
 #include "server.hpp"
+#include "boost/asio/registered_buffer.hpp"
+#include "boost/cobalt/promise.hpp"
+#include "boost/cobalt/this_thread.hpp"
+#include "boost/cobalt/wait_group.hpp"
+#include "boost/json/impl/serialize.ipp"
 #include <algorithm>
+#include <array>
 #include <boost/cobalt/this_coro.hpp>
 
 #include <boost/json/src.hpp>
@@ -64,8 +70,7 @@ boost::cobalt::promise<void> Server::tcp_accept(tcp_socket s) {
   // incoming
   //
 
-  auto current_subscriptions =
-      std::map<TCPChatRoom *, boost::cobalt::promise<void>>{};
+  auto current_subscriptions = std::map<TCPChatRoom *, subscription>{};
   for (;;) {
     const auto data = co_await parse_data(s);
     std::println("Got data: {}", std::string_view{data.begin(), data.end()});
@@ -94,7 +99,11 @@ boost::cobalt::promise<void> Server::tcp_accept(tcp_socket s) {
                           //
                           auto &[channel, chat_room] = res;
                           current_subscriptions.emplace(
-                              chat_room, spawn_listener(s, channel, chat_room));
+                              chat_room,
+                              std::make_pair(
+                                  spawn_listener(s, std::weak_ptr{channel},
+                                                 chat_room),
+                                  std::move(channel)));
                         },
                         [&](std::string_view error) {
                           +([&]() -> boost::cobalt::promise<void> {
@@ -125,6 +134,49 @@ boost::cobalt::promise<void> Server::tcp_accept(tcp_socket s) {
 
         } else [[likely]] if (value == "message") {
 
+          co_await std::visit(
+              overloads{
+                  [&](Message &&m) -> boost::cobalt::promise<void> {
+                    auto &&[message, chat_room] = m;
+                    std::lock_guard guard{chat_room->mutex};
+
+                    // make sure that we have a subscription to the
+                    // chat_room
+                    if (not current_subscriptions.contains(chat_room)) {
+                      co_await s.async_send(
+                          boost::asio::buffer("not subscriped to this room\n"));
+                      co_return;
+                    }
+
+                    auto &[_, curr_chan] = current_subscriptions[chat_room];
+
+                    auto subscriptions =
+                        chat_room->connections |
+                        std::views::filter(
+                            [&](std::weak_ptr<Channel<std::string>> chan) {
+                              return chan.lock() != curr_chan;
+                            });
+
+                    auto wg = boost::cobalt::wait_group{};
+
+                    for (const std::weak_ptr<Channel<std::string>> connection :
+                         subscriptions) {
+                      auto res = boost::json::serialize(boost::json::object{
+                          {"grp", chat_room->name}, {"message", message}});
+
+                      wg.push_back([&]() -> boost::cobalt::promise<void> {
+                          co_await connection.lock()->write(std::string{res.c_str()}));
+                      }());
+                    }
+
+                    co_await wg;
+                  },
+                  [&](std::string_view error) -> boost::cobalt::promise<void> {
+                    s.async_send(boost::asio::buffer(
+                        std::format("Failed to send msg: {}", error)));
+                  }},
+              parse_message(structured_data));
+
         } else {
           std::println("Invalid JSON");
           co_await s.async_send(boost::asio::buffer("Invalid JSON"));
@@ -137,24 +189,14 @@ boost::cobalt::promise<void> Server::tcp_accept(tcp_socket s) {
 boost::cobalt::promise<std::variant<
     std::pair<std::shared_ptr<Channel<std::string>>, TCPChatRoom *>,
     std::string_view>>
-Server::handle_sub(
-    boost::json::object &structured_data,
-    const std::map<TCPChatRoom *, boost::cobalt::promise<void>> &listener_map) {
+Server::handle_sub(boost::json::object &structured_data,
+                   const std::map<TCPChatRoom *, subscription> &listener_map) {
   // get code of the subbed group
   if (not structured_data.contains("grp")) {
     co_return "grp not found";
   }
 
-  const auto grp_res = [&] -> std::optional<uint64_t> {
-    if (auto grp_result_uint64_t = structured_data.at("grp").try_as_uint64()) {
-      return *grp_result_uint64_t;
-    }
-    if (auto grp_result_int64_t = structured_data.at("grp").try_as_int64()) {
-      return static_cast<uint64_t>(*grp_result_int64_t);
-    }
-
-    return std::optional<uint64_t>{};
-  }();
+  const auto grp_res = parse_id(structured_data, "grp");
 
   if (not grp_res) {
     co_return "grp not valid";
@@ -229,4 +271,38 @@ Server::spawn_listener(tcp_socket &socket,
         {"type", "message"}, {"data", data}, {"grp_name", chat_room->name}});
     co_await socket.async_send(boost::asio::buffer(json_str));
   }
+}
+
+auto Server::parse_message(boost::json::object &data)
+    -> std::variant<Message, std::string_view> {
+  if (not data.contains("grp")) {
+    return "no grp found";
+  }
+  if (not data.contains("msg")) {
+    return "no msg found";
+  }
+
+  if (auto grp_res = parse_id(data, "grp")) {
+    auto grp = *grp_res;
+    if (auto room = try_find_room(grp)) {
+      auto message = std::string_view{data.at("msg").as_string()};
+      return std::pair{message, *room};
+    } else {
+      return "grp not found";
+    }
+  } else {
+    return "invalid grp";
+  }
+}
+
+auto parse_id(boost::json::object &data, std::string_view key)
+    -> std::optional<uint64_t> {
+  if (auto grp_result_uint64_t = data.at("grp").try_as_uint64()) {
+    return *grp_result_uint64_t;
+  }
+  if (auto grp_result_int64_t = data.at("grp").try_as_int64()) {
+    return static_cast<uint64_t>(*grp_result_int64_t);
+  }
+
+  return std::optional<uint64_t>{};
 }

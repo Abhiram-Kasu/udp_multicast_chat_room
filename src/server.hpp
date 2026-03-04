@@ -1,6 +1,7 @@
 #pragma once
 #include "udp_server.hpp"
 #include <boost/asio.hpp>
+#include <boost/cobalt.hpp>
 #include <boost/cobalt/channel.hpp>
 #include <boost/cobalt/op.hpp>
 #include <boost/cobalt/promise.hpp>
@@ -55,12 +56,13 @@ public:
   boost::cobalt::promise<void> serve();
 
 private:
+  using subscription = std::pair<boost::cobalt::promise<void>,
+                                 std::shared_ptr<Channel<std::string>>>;
   boost::cobalt::promise<std::variant<
       std::pair<std::shared_ptr<Channel<std::string>>, TCPChatRoom *>,
       std::string_view>>
   handle_sub(boost::json::object &,
-             const std::map<TCPChatRoom *, boost::cobalt::promise<void>>
-                 &listener_map);
+             const std::map<TCPChatRoom *, subscription> &listener_map);
   std::shared_ptr<Channel<std::string>> sub_to_room(TCPChatRoom &room_id);
 
   boost::cobalt::promise<void>
@@ -74,6 +76,12 @@ private:
       std::string_view>>
   handle_create_and_sub(boost::json::object &);
   static boost::cobalt::promise<std::vector<char>> parse_data(tcp_socket &s);
+  using Message = std::pair<std::string_view, TCPChatRoom *>;
+  auto parse_message(boost::json::object &data)
+      -> std::variant<Message, std::string_view>;
+
+  auto parse_id(boost::json::object &data, std::string_view key)
+      -> std::optional<uint64_t>;
   boost::cobalt::promise<void> accept_connections();
   boost::cobalt::promise<void> tcp_accept(tcp_socket s);
   void init_udp_server() {}
