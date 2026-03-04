@@ -12,6 +12,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <thread>
 
 using boost::asio::ip::tcp;
 using boost::asio::ip::udp;
@@ -50,7 +51,10 @@ public:
 
   ~Server();
 
-  boost::cobalt::promise<void> serve();
+  /// Sets up the io_context, spawns the async server logic onto it,
+  /// and runs it across a thread pool. Blocks until shutdown.
+  void serve(
+      size_t thread_count = std::max(1u, std::thread::hardware_concurrency()));
 
 private:
   using subscription = std::pair<boost::cobalt::promise<void>,
@@ -79,6 +83,7 @@ private:
 
   auto parse_id(boost::json::object &data, std::string_view key)
       -> std::optional<uint64_t>;
+  boost::cobalt::task<void> serve_async();
   boost::cobalt::promise<void> accept_connections();
   boost::cobalt::promise<void> tcp_accept(tcp_socket s);
   void init_udp_server() {}

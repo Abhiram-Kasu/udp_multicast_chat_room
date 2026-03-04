@@ -1,19 +1,18 @@
 #include "server.hpp"
-#include "boost/asio/registered_buffer.hpp"
 #include "boost/cobalt/io/signal_set.hpp"
 #include "boost/cobalt/promise.hpp"
 #include "boost/cobalt/race.hpp"
-#include "boost/cobalt/this_thread.hpp"
+#include "boost/cobalt/spawn.hpp"
+#include "boost/cobalt/task.hpp"
 #include "boost/cobalt/wait_group.hpp"
 #include "boost/json/impl/serialize.ipp"
 #include <algorithm>
 #include <array>
 #include <boost/cobalt/this_coro.hpp>
+#include <boost/json/src.hpp>
 #include <boost/system/system_error.hpp>
 #include <csignal>
 #include <exception>
-
-#include <boost/json/src.hpp>
 #include <format>
 #include <map>
 #include <memory>
@@ -32,8 +31,39 @@ Server::Server(int address, uint64_t max_room_limit)
 
 Server::~Server() = default;
 
-boost::cobalt::promise<void> Server::serve() {
-  std::println("Server::serve starting on port {}", m_listening_port);
+void Server::serve(size_t thread_count) {
+  std::println("Server::serve starting on port {} with {} threads",
+               m_listening_port, thread_count);
+
+  auto io_context = boost::asio::io_context{};
+
+  boost::cobalt::spawn(io_context, serve_async(), [](std::exception_ptr e) {
+    if (e) {
+      try {
+        std::rethrow_exception(e);
+      } catch (const std::exception &ex) {
+        std::println("server error: {}", ex.what());
+      }
+    }
+  });
+
+  std::vector<std::jthread> threads;
+  threads.reserve(thread_count - 1);
+  for (auto i{1uz}; i < thread_count; ++i) {
+    threads.emplace_back([&io_context, i]() {
+      std::println("worker thread {} started", i);
+      io_context.run();
+      std::println("worker thread {} finished", i);
+    });
+  }
+
+  std::println("main thread entering io_context::run()");
+  io_context.run();
+  std::println("main thread exiting");
+}
+
+boost::cobalt::task<void> Server::serve_async() {
+  std::println("Server::serve_async starting on port {}", m_listening_port);
   auto exec = co_await boost::cobalt::this_coro::executor;
 
   m_tcp_server_acceptor.emplace(exec);
@@ -43,30 +73,31 @@ boost::cobalt::promise<void> Server::serve() {
   acceptor.bind(tcp::endpoint(tcp::v4(), m_listening_port));
   acceptor.listen();
 
-  std::println("Server::serve acceptor ready");
+  std::println("Server::serve_async acceptor ready");
   std::println("listening on {}", m_listening_port);
 
   boost::cobalt::io::signal_set signals({SIGINT, SIGTERM}, exec);
 
   auto shutdown = [&]() -> boost::cobalt::promise<void> {
-    std::println("Server::serve waiting for shutdown signal");
+    std::println("Server::serve_async waiting for shutdown signal");
     auto sig = co_await signals.wait();
-    std::println("Server::serve shutdown signal received ({})", sig);
+    std::println("Server::serve_async shutdown signal received ({})", sig);
     if (m_tcp_server_acceptor) {
       boost::system::error_code ec;
       m_tcp_server_acceptor->close(ec);
       if (ec) {
-        std::println("Server::serve acceptor close error: {}", ec.message());
+        std::println("Server::serve_async acceptor close error: {}",
+                     ec.message());
       } else {
-        std::println("Server::serve acceptor closed");
+        std::println("Server::serve_async acceptor closed");
       }
     }
     co_return;
   };
 
-  std::println("Server::serve entering accept loop");
+  std::println("Server::serve_async entering accept loop");
   co_await boost::cobalt::race(accept_connections(), shutdown());
-  std::println("Server::serve accept loop exited");
+  std::println("Server::serve_async accept loop exited");
 }
 
 boost::cobalt::promise<void> Server::accept_connections() {
