@@ -1,12 +1,17 @@
 #include "server.hpp"
 #include "boost/asio/registered_buffer.hpp"
+#include "boost/cobalt/io/signal_set.hpp"
 #include "boost/cobalt/promise.hpp"
+#include "boost/cobalt/race.hpp"
 #include "boost/cobalt/this_thread.hpp"
 #include "boost/cobalt/wait_group.hpp"
 #include "boost/json/impl/serialize.ipp"
 #include <algorithm>
 #include <array>
 #include <boost/cobalt/this_coro.hpp>
+#include <boost/system/system_error.hpp>
+#include <csignal>
+#include <exception>
 
 #include <boost/json/src.hpp>
 #include <format>
@@ -30,12 +35,37 @@ Server::~Server() = default;
 boost::cobalt::promise<void> Server::serve() {
   std::println("Server::serve starting on port {}", m_listening_port);
   auto exec = co_await boost::cobalt::this_coro::executor;
-  m_tcp_server_acceptor.emplace(exec,
-                                tcp::endpoint(tcp::v4(), m_listening_port));
+
+  m_tcp_server_acceptor.emplace(exec);
+  auto &acceptor = *m_tcp_server_acceptor;
+  acceptor.open(tcp::v4());
+  acceptor.set_option(boost::asio::socket_base::reuse_address(true));
+  acceptor.bind(tcp::endpoint(tcp::v4(), m_listening_port));
+  acceptor.listen();
+
   std::println("Server::serve acceptor ready");
   std::println("listening on {}", m_listening_port);
+
+  boost::cobalt::io::signal_set signals({SIGINT, SIGTERM}, exec);
+
+  auto shutdown = [&]() -> boost::cobalt::promise<void> {
+    std::println("Server::serve waiting for shutdown signal");
+    auto sig = co_await signals.wait();
+    std::println("Server::serve shutdown signal received ({})", sig);
+    if (m_tcp_server_acceptor) {
+      boost::system::error_code ec;
+      m_tcp_server_acceptor->close(ec);
+      if (ec) {
+        std::println("Server::serve acceptor close error: {}", ec.message());
+      } else {
+        std::println("Server::serve acceptor closed");
+      }
+    }
+    co_return;
+  };
+
   std::println("Server::serve entering accept loop");
-  co_await accept_connections();
+  co_await boost::cobalt::race(accept_connections(), shutdown());
   std::println("Server::serve accept loop exited");
 }
 
@@ -47,9 +77,14 @@ boost::cobalt::promise<void> Server::accept_connections() {
   auto &acceptor = *m_tcp_server_acceptor;
   for (;;) {
     std::println("accept_connections: waiting for connection");
-    auto socket = co_await acceptor.async_accept();
-    std::println("accept_connections: received connection");
-    co_await tcp_accept(std::move(socket));
+    try {
+      auto socket = co_await acceptor.async_accept();
+      std::println("accept_connections: received connection");
+      co_await tcp_accept(std::move(socket));
+    } catch (const boost::system::system_error &err) {
+      std::println("accept_connections: accept error: {}", err.what());
+      co_return;
+    }
   }
 }
 
@@ -82,153 +117,179 @@ boost::cobalt::promise<void> Server::tcp_accept(tcp_socket s) {
   std::println("tcp_accept: session started");
   auto current_subscriptions = std::map<TCPChatRoom *, subscription>{};
   for (;;) {
-    std::println("tcp_accept: waiting for next message");
-    const auto data = co_await parse_data(s);
-    std::println("tcp_accept: received raw data ({} bytes): {}", data.size(),
-                 std::string_view{data.begin(), data.end()});
-    std::string_view data_str{data.begin(), data.end()};
-    boost::system::error_code error_code;
-    auto structured_data = boost::json::parse(data_str, error_code).as_object();
-    if (error_code.failed()) {
-      std::println("tcp_accept: failed to parse JSON: {}",
-                   error_code.message());
-      co_await s.async_send(
-          boost::asio::buffer("Failed to parse JSON: " + error_code.message()));
-    }
-    if (structured_data.contains("type")) {
-      if (auto type = structured_data.at("type").try_as_string()) {
-        // if the type
-        const std::string &value = type.value().c_str();
-        std::println("tcp_accept: message type={}", value);
+    try {
+      std::println("tcp_accept: waiting for next message");
+      const auto data = co_await parse_data(s);
+      std::println("tcp_accept: received raw data ({} bytes): {}", data.size(),
+                   std::string_view{data.begin(), data.end()});
 
-        if (value == "sub") {
-          std::println("tcp_accept: handling sub request");
-          // check if we already have a listener
+      if (data.empty()) {
+        std::println("tcp_accept: received empty line, ignoring");
+        continue;
+      }
 
-          std::visit(
-              overloads{
-                  [&](std::pair<std::shared_ptr<Channel<std::string>>,
-                                TCPChatRoom *>
-                          res) {
-                    // update current subscriptions
-                    //
-                    auto &[channel, chat_room] = res;
-                    current_subscriptions.emplace(
-                        chat_room,
-                        std::make_pair(spawn_listener(s, std::weak_ptr{channel},
-                                                      chat_room),
-                                       std::move(channel)));
-                    std::println("tcp_accept: subscribed to room id={} name={}",
-                                 chat_room->id, chat_room->name);
-                  },
-                  [&](std::string_view error) {
-                    std::println("tcp_accept: sub failed: {}", error);
-                    +([&]() -> boost::cobalt::promise<void> {
-                      co_await s.async_send(boost::asio::buffer(
-                          std::format("Failed: {}", error)));
-                    }());
-                  }},
-              co_await handle_sub(structured_data, current_subscriptions));
-        } else if (value == "desub") {
-          std::println("tcp_accept: desub request received, ending session");
-          co_return;
-        } else if (value == "csub") {
-          std::println("tcp_accept: handling create+sub request");
-          std::visit(
-              overloads{
-                  [&](std::pair<std::shared_ptr<Channel<std::string>>,
-                                TCPChatRoom *>
-                          res) {
-                    auto &[channel, chat_room] = res;
-                    current_subscriptions.emplace(
-                        chat_room,
-                        std::make_pair(spawn_listener(s, channel, chat_room),
-                                       std::move(channel)));
-                    std::println(
-                        "tcp_accept: created+subscribed room id={} name={}",
-                        chat_room->id, chat_room->name);
-                  },
-                  [&](std::string_view error) {
-                    std::println("tcp_accept: create+sub failed: {}", error);
-                    auto res = ([&]() -> boost::cobalt::promise<void> {
-                      co_await s.async_send(boost::asio::buffer(std::format(
-                          "Failed to create and subscribe: {}", error)));
-                    }());
-                  }},
-              co_await handle_create_and_sub(structured_data));
+      std::string_view data_str{data.begin(), data.end()};
+      boost::system::error_code error_code;
+      auto parsed = boost::json::parse(data_str, error_code);
+      if (error_code.failed()) {
+        std::println("tcp_accept: failed to parse JSON: {}",
+                     error_code.message());
+        co_await s.async_send(boost::asio::buffer("Failed to parse JSON: " +
+                                                  error_code.message()));
+        continue;
+      }
+      if (!parsed.is_object()) {
+        std::println("tcp_accept: invalid JSON (not an object)");
+        co_await s.async_send(boost::asio::buffer("Invalid JSON"));
+        continue;
+      }
 
-        } else [[likely]] if (value == "message") {
-          std::println("tcp_accept: handling message request");
-          co_await std::visit(
-              overloads{
-                  [&](Message &&m) -> boost::cobalt::promise<void> {
-                    auto &&[message, chat_room] = m;
-                    std::lock_guard guard{chat_room->mutex};
+      auto structured_data = parsed.as_object();
 
-                    // make sure that we have a subscription to the
-                    // chat_room
-                    if (not current_subscriptions.contains(chat_room)) {
+      if (structured_data.contains("type")) {
+        if (auto type = structured_data.at("type").try_as_string()) {
+          // if the type
+          const std::string &value = type.value().c_str();
+          std::println("tcp_accept: message type={}", value);
+
+          if (value == "sub") {
+            std::println("tcp_accept: handling sub request");
+            // check if we already have a listener
+
+            std::visit(
+                overloads{[&](std::pair<std::shared_ptr<Channel<std::string>>,
+                                        TCPChatRoom *>
+                                  res) {
+                            // update current subscriptions
+                            //
+                            auto &[channel, chat_room] = res;
+                            current_subscriptions.emplace(
+                                chat_room,
+                                std::make_pair(
+                                    spawn_listener(s, std::weak_ptr{channel},
+                                                   chat_room),
+                                    std::move(channel)));
+                            std::println(
+                                "tcp_accept: subscribed to room id={} name={}",
+                                chat_room->id, chat_room->name);
+                          },
+                          [&](std::string_view error) {
+                            std::println("tcp_accept: sub failed: {}", error);
+                            +([&]() -> boost::cobalt::promise<void> {
+                              co_await s.async_send(boost::asio::buffer(
+                                  std::format("Failed: {}", error)));
+                            }());
+                          }},
+                co_await handle_sub(structured_data, current_subscriptions));
+          } else if (value == "desub") {
+            std::println("tcp_accept: desub request received, ending session");
+            co_return;
+          } else if (value == "csub") {
+            std::println("tcp_accept: handling create+sub request");
+            std::visit(
+                overloads{
+                    [&](std::pair<std::shared_ptr<Channel<std::string>>,
+                                  TCPChatRoom *>
+                            res) {
+                      auto &[channel, chat_room] = res;
+                      current_subscriptions.emplace(
+                          chat_room,
+                          std::make_pair(spawn_listener(s, channel, chat_room),
+                                         std::move(channel)));
                       std::println(
-                          "tcp_accept: message rejected (not subscribed)");
-                      co_await s.async_send(
-                          boost::asio::buffer("not subscriped to this room\n"));
-                      co_return;
-                    }
-
-                    auto &curr_chan =
-                        current_subscriptions.at(chat_room).second;
-
-                    auto recipient_count = std::ranges::count_if(
-                        chat_room->connections,
-                        [&](std::weak_ptr<Channel<std::string>> chan) {
-                          return chan.lock() != curr_chan;
-                        });
-                    std::println(
-                        "tcp_accept: broadcasting message ({} bytes) to {} "
-                        "recipients in room id={} name={}",
-                        message.size(), recipient_count, chat_room->id,
-                        chat_room->name);
-
-                    auto subscriptions =
-                        chat_room->connections |
-                        std::views::filter(
-                            [&](std::weak_ptr<Channel<std::string>> chan) {
-                              return chan.lock() != curr_chan;
-                            });
-
-                    auto wg = boost::cobalt::wait_group{};
-
-                    for (const auto connection : subscriptions) {
-                      auto res = boost::json::serialize(boost::json::object{
-                          {"grp", chat_room->name}, {"message", message}});
-
-                      wg.push_back([&]() -> boost::cobalt::promise<void> {
-                        co_await connection.lock()->write(
-                            std::string{res.c_str()});
+                          "tcp_accept: created+subscribed room id={} name={}",
+                          chat_room->id, chat_room->name);
+                    },
+                    [&](std::string_view error) {
+                      std::println("tcp_accept: create+sub failed: {}", error);
+                      auto res = ([&]() -> boost::cobalt::promise<void> {
+                        co_await s.async_send(boost::asio::buffer(std::format(
+                            "Failed to create and subscribe: {}", error)));
                       }());
-                    }
+                    }},
+                co_await handle_create_and_sub(structured_data));
 
-                    co_await wg;
-                    std::println("tcp_accept: broadcast complete");
-                  },
-                  [&](std::string_view error) -> boost::cobalt::promise<void> {
-                    std::println("tcp_accept: message parse error: {}", error);
-                    co_await s.async_send(boost::asio::buffer(
-                        std::format("Failed to send msg: {}", error)));
-                  }},
-              parse_message(structured_data));
+          } else [[likely]] if (value == "message") {
+            std::println("tcp_accept: handling message request");
+            co_await std::visit(
+                overloads{
+                    [&](Message &&m) -> boost::cobalt::promise<void> {
+                      auto &&[message, chat_room] = m;
+                      std::lock_guard guard{chat_room->mutex};
 
+                      // make sure that we have a subscription to the
+                      // chat_room
+                      if (not current_subscriptions.contains(chat_room)) {
+                        std::println(
+                            "tcp_accept: message rejected (not subscribed)");
+                        co_await s.async_send(boost::asio::buffer(
+                            "not subscriped to this room\n"));
+                        co_return;
+                      }
+
+                      auto &curr_chan =
+                          current_subscriptions.at(chat_room).second;
+
+                      auto recipient_count = std::ranges::count_if(
+                          chat_room->connections,
+                          [&](std::weak_ptr<Channel<std::string>> chan) {
+                            return chan.lock() != curr_chan;
+                          });
+                      std::println(
+                          "tcp_accept: broadcasting message ({} bytes) to {} "
+                          "recipients in room id={} name={}",
+                          message.size(), recipient_count, chat_room->id,
+                          chat_room->name);
+
+                      auto subscriptions =
+                          chat_room->connections |
+                          std::views::filter(
+                              [&](std::weak_ptr<Channel<std::string>> chan) {
+                                return chan.lock() != curr_chan;
+                              });
+
+                      auto wg = boost::cobalt::wait_group{};
+
+                      for (const auto connection : subscriptions) {
+                        auto res = boost::json::serialize(boost::json::object{
+                            {"grp", chat_room->name}, {"message", message}});
+
+                        wg.push_back([&]() -> boost::cobalt::promise<void> {
+                          co_await connection.lock()->write(
+                              std::string{res.c_str()});
+                        }());
+                      }
+
+                      co_await wg;
+                      std::println("tcp_accept: broadcast complete");
+                    },
+                    [&](std::string_view error)
+                        -> boost::cobalt::promise<void> {
+                      std::println("tcp_accept: message parse error: {}",
+                                   error);
+                      co_await s.async_send(boost::asio::buffer(
+                          std::format("Failed to send msg: {}", error)));
+                    }},
+                parse_message(structured_data));
+
+          } else {
+            std::println("tcp_accept: Invalid JSON (unknown type)");
+            co_await s.async_send(boost::asio::buffer("Invalid JSON"));
+          }
         } else {
-          std::println("tcp_accept: Invalid JSON (unknown type)");
+          std::println("tcp_accept: type field is not a string");
           co_await s.async_send(boost::asio::buffer("Invalid JSON"));
         }
       } else {
-        std::println("tcp_accept: type field is not a string");
+        std::println("tcp_accept: missing type field");
         co_await s.async_send(boost::asio::buffer("Invalid JSON"));
       }
-    } else {
-      std::println("tcp_accept: missing type field");
-      co_await s.async_send(boost::asio::buffer("Invalid JSON"));
+    } catch (const boost::system::system_error &err) {
+      std::println("tcp_accept: system_error: {}", err.what());
+      co_return;
+    } catch (const std::exception &err) {
+      std::println("tcp_accept: exception: {}", err.what());
+      co_return;
     }
   }
 }
@@ -337,12 +398,20 @@ Server::spawn_listener(tcp_socket &socket,
   std::println("spawn_listener: started for room id={} name={}", chat_room->id,
                chat_room->name);
   while (not chan.expired() and chan.lock()->is_open() && socket.is_open()) {
-    auto data = co_await chan.lock()->read();
-    std::println("spawn_listener: room id={} sending message ({} bytes)",
-                 chat_room->id, data.size());
-    auto json_str = boost::json::serialize(boost::json::object{
-        {"type", "message"}, {"data", data}, {"grp_name", chat_room->name}});
-    co_await socket.async_send(boost::asio::buffer(json_str));
+    try {
+      auto data = co_await chan.lock()->read();
+      std::println("spawn_listener: room id={} sending message ({} bytes)",
+                   chat_room->id, data.size());
+      auto json_str = boost::json::serialize(boost::json::object{
+          {"type", "message"}, {"data", data}, {"grp_name", chat_room->name}});
+      co_await socket.async_send(boost::asio::buffer(json_str));
+    } catch (const boost::system::system_error &err) {
+      std::println("spawn_listener: system_error: {}", err.what());
+      break;
+    } catch (const std::exception &err) {
+      std::println("spawn_listener: exception: {}", err.what());
+      break;
+    }
   }
   std::println("spawn_listener: exiting for room id={} name={}", chat_room->id,
                chat_room->name);
