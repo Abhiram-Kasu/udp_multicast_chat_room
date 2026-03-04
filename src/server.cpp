@@ -122,7 +122,9 @@ boost::cobalt::promise<void> Server::tcp_accept(tcp_socket s) {
                           res) {
                     auto &[channel, chat_room] = res;
                     current_subscriptions.emplace(
-                        chat_room, spawn_listener(s, channel, chat_room));
+                        chat_room,
+                        std::make_pair(spawn_listener(s, channel, chat_room),
+                                       std::move(channel)));
                   },
                   [&](std::string_view error) {
                     auto res = ([&]() -> boost::cobalt::promise<void> {
@@ -148,7 +150,8 @@ boost::cobalt::promise<void> Server::tcp_accept(tcp_socket s) {
                       co_return;
                     }
 
-                    auto &[_, curr_chan] = current_subscriptions[chat_room];
+                    auto &curr_chan =
+                        current_subscriptions.at(chat_room).second;
 
                     auto subscriptions =
                         chat_room->connections |
@@ -159,20 +162,20 @@ boost::cobalt::promise<void> Server::tcp_accept(tcp_socket s) {
 
                     auto wg = boost::cobalt::wait_group{};
 
-                    for (const std::weak_ptr<Channel<std::string>> connection :
-                         subscriptions) {
+                    for (const auto connection : subscriptions) {
                       auto res = boost::json::serialize(boost::json::object{
                           {"grp", chat_room->name}, {"message", message}});
 
                       wg.push_back([&]() -> boost::cobalt::promise<void> {
-                          co_await connection.lock()->write(std::string{res.c_str()}));
+                        co_await connection.lock()->write(
+                            std::string{res.c_str()});
                       }());
                     }
 
                     co_await wg;
                   },
                   [&](std::string_view error) -> boost::cobalt::promise<void> {
-                    s.async_send(boost::asio::buffer(
+                    co_await s.async_send(boost::asio::buffer(
                         std::format("Failed to send msg: {}", error)));
                   }},
               parse_message(structured_data));
@@ -295,12 +298,12 @@ auto Server::parse_message(boost::json::object &data)
   }
 }
 
-auto parse_id(boost::json::object &data, std::string_view key)
+auto Server::parse_id(boost::json::object &data, std::string_view key)
     -> std::optional<uint64_t> {
-  if (auto grp_result_uint64_t = data.at("grp").try_as_uint64()) {
+  if (auto grp_result_uint64_t = data.at(key).try_as_uint64()) {
     return *grp_result_uint64_t;
   }
-  if (auto grp_result_int64_t = data.at("grp").try_as_int64()) {
+  if (auto grp_result_int64_t = data.at(key).try_as_int64()) {
     return static_cast<uint64_t>(*grp_result_int64_t);
   }
 
