@@ -439,9 +439,9 @@ Server::handle_create_and_sub(boost::json::object &data) {
     const auto &grp_name = std::string_view{data.at("grp_name").as_string()};
 
     std::lock_guard<std::mutex> guard{this->chat_room_mutex};
-    auto &room = this->chatRooms.emplace_back(std::string(grp_name),
-                                              TCPChatRoom::connection_list{},
-                                              chatRooms.size() + 1);
+    auto &room = this->chat_rooms.emplace_back(std::string(grp_name),
+                                               TCPChatRoom::connection_list{},
+                                               chat_rooms.size() + 1);
     std::println("handle_create_and_sub: created room id={} name={}", room.id,
                  room.name);
     return room;
@@ -454,8 +454,8 @@ std::optional<TCPChatRoom *> Server::try_find_room(uint64_t room_id) {
   std::println("try_find_room: searching for room id={}", room_id);
   std::lock_guard<std::mutex> mut{chat_room_mutex};
   if (auto chat_room = std::ranges::find_if(
-          chatRooms, [&](const auto &room) { return room.id == room_id; });
-      chat_room != chatRooms.end()) {
+          chat_rooms, [&](const auto &room) { return room.id == room_id; });
+      chat_room != chat_rooms.end()) {
     std::println("try_find_room: found room id={} name={}", chat_room->id,
                  chat_room->name);
     return std::addressof(*chat_room);

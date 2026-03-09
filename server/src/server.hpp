@@ -1,8 +1,8 @@
 #pragma once
+#include "tcp_chat_room.hpp"
 #include "udp_server.hpp"
 #include <boost/asio.hpp>
 #include <boost/cobalt.hpp>
-
 #include <boost/json/object.hpp>
 #include <boost/json/parse.hpp>
 #include <boost/json/serialize.hpp>
@@ -23,18 +23,6 @@ template <class... Ts> struct overloads : Ts... {
   using Ts::operator()...;
 };
 
-template <typename Message> using Channel = boost::cobalt::channel<Message>;
-
-struct TCPChatRoom {
-  using connection_list = std::vector<std::weak_ptr<Channel<std::string>>>;
-  std::mutex mutex{};
-  std::string name;
-  connection_list connections;
-  uint64_t id;
-  TCPChatRoom(const std::string &name, connection_list connections, uint64_t id)
-      : name(name), connections(connections), id(id) {}
-};
-
 struct Server {
 private:
   int m_listening_port;
@@ -44,7 +32,7 @@ private:
   std::optional<UDP_Server> m_udp_server;
 
   std::mutex chat_room_mutex;
-  std::list<TCPChatRoom> chatRooms;
+  std::list<TCPChatRoom> chat_rooms;
 
 public:
   Server(int address, uint64_t max_room_limit);
