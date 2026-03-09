@@ -2,109 +2,98 @@
 
 A high-performance chat room server designed to automatically upgrade to UDP multicast for efficient message broadcasting, trading reliability for speed and scalability.
 
-## Project Overview
+## Table of Contents
 
-This project implements a chat room system that leverages UDP multicast to broadcast messages to multiple users simultaneously. The goal is to create a scalable chat infrastructure that can handle many users efficiently by using UDP multicast for message distribution, despite the inherent trade-off in reliability compared to TCP.
+1. [Overview](#1-overview)
+2. [Getting Started](#2-getting-started)
+   - 2.1 [Prerequisites](#21-prerequisites)
+   - 2.2 [Building](#22-building)
+   - 2.3 [Running](#23-running)
+3. [Architecture](#3-architecture)
+   - 3.1 [High-Level Diagram](#31-high-level-diagram)
+   - 3.2 [Source Layout](#32-source-layout)
+   - 3.3 [Key Types](#33-key-types)
+4. [Protocol Reference](#4-protocol-reference)
+   - 4.1 [Message Framing](#41-message-framing)
+   - 4.2 [Client → Server Messages](#42-client--server-messages)
+   - 4.3 [Server → Client Messages](#43-server--client-messages)
+5. [Technologies & Libraries](#5-technologies--libraries)
+   - 5.1 [Language](#51-language)
+   - 5.2 [Core Libraries](#52-core-libraries)
+   - 5.3 [Build System](#53-build-system)
+6. [Implementation Status](#6-implementation-status)
+   - 6.1 [Completed](#61-completed)
+   - 6.2 [In Progress](#62-in-progress)
+7. [Future Goals](#7-future-goals)
+8. [Design Philosophy](#8-design-philosophy)
 
-## Project Goals
+---
 
-### Primary Aim
-Create chat rooms that **automatically upgrade to UDP multicast** to broadcast updates to users. This approach prioritizes:
-- **Speed**: Low-latency message delivery
-- **Scalability**: Efficient broadcasting to multiple clients
-- **Resource Efficiency**: Reduced server load compared to TCP-based message distribution
+## 1. Overview
 
-The system accepts the trade-off of reduced reliability (UDP's connectionless nature) for improved performance and scalability in chat room scenarios.
+This project implements a chat room system where clients connect over TCP and exchange newline-delimited JSON messages. The long-term goal is to upgrade rooms to UDP multicast for efficient message distribution, trading some reliability for speed and scalability.
 
-## Current Implementation Status
+## 2. Getting Started
 
-### Completed Features
+### 2.1 Prerequisites
 
-1. **TCP-based Server Infrastructure**
-   - TCP acceptor running on port 4040 (configurable)
-   - Asynchronous I/O using coroutines (C++26)
-   - Non-blocking connection handling
+| Dependency | Minimum Version | Notes |
+|---|---|---|
+| CMake | 3.5 | |
+| C++ compiler | GCC 14+ / Clang 16+ | Must support C++26 |
+| Boost | 1.84+ | Installed at `/usr/local/boost/` |
 
-2. **Chat Room Management**
-   - Multiple chat room support with unique room IDs
-   - Room limit enforcement (configurable max rooms)
-   - Thread-safe connection management with mutex protection
+Required Boost components: **Asio**, **Cobalt**, **JSON**.
 
-3. **Custom Socket Protocol**
-   - Custom protocol over raw sockets (not HTTP)
-   - Message format: `<size> <JSON_payload>`
-   - JSON-based message structure with type-based routing
+### 2.2 Building
 
-4. **Client Message Types**
-   - `sub`: Subscribe to a chat room by group ID
-   - `desub`: Unsubscribe from a chat room
-   - `message`: Send messages within a room
+```bash
+mkdir build && cd build
+cmake ..
+cmake --build .
+```
 
-5. **Asynchronous Message Broadcasting**
-   - Channel-based message distribution to subscribers
-   - Non-blocking send operations
-   - Automatic cleanup of disconnected clients (weak_ptr management)
+### 2.3 Running
 
-### In Progress
+```bash
+# Default thread count (std::thread::hardware_concurrency)
+./udp_multicast_chat_room
 
-1. **UDP Multicast Infrastructure**
-   - UDP_Server class defined but not yet implemented
-   - Placeholder for multicast logic
+# Explicit thread-pool size
+./udp_multicast_chat_room -j4
+```
 
-## Technologies & Libraries
+The server listens on **port 4040**. Send SIGINT (`Ctrl-C`) or SIGTERM to shut it down gracefully.
 
-### Programming Language
-- **C++26**: Leveraging the latest C++ standard for modern features
+## 3. Architecture
 
-### Core Libraries
-
-1. **Boost.Asio** (Primary Networking Library)
-   - Asynchronous I/O operations
-   - TCP socket management
-   - Coroutine support for `co_await` patterns
-   - Experimental channels for inter-coroutine communication
-
-2. **Boost.JSON**
-   - JSON parsing and serialization
-   - Message structure encoding/decoding
-
-### Build System
-- **CMake** (version 3.1+)
-- Custom compiler flags for C++26 standard
-- Boost library integration
-
-### Development Environment
-- Homebrew-based Boost installation (macOS/Linux)
-- Compile commands export for IDE integration
-
-## Current Infrastructure
-
-### Architecture
+### 3.1 High-Level Diagram
 
 ```
-┌─────────────────────────────────────────────────┐
-│                 Server (Port 4040)              │
-├─────────────────────────────────────────────────┤
-│                                                 │
-│  ┌─────────────────────────────────────────┐   │
-│  │     TCP Acceptor (Boost.Asio)           │   │
-│  │  - Async connection acceptance           │   │
-│  │  - Coroutine-based handling              │   │
-│  └─────────────────────────────────────────┘   │
-│                                                 │
-│  ┌─────────────────────────────────────────┐   │
-│  │    Chat Rooms (std::list)               │   │
-│  │  - Room ID management                    │   │
-│  │  - Thread-safe connection vectors        │   │
-│  │  - Channel-based broadcasting            │   │
-│  └─────────────────────────────────────────┘   │
-│                                                 │
-│  ┌─────────────────────────────────────────┐   │
-│  │   UDP Multicast Server (Future)         │   │
-│  │  - Not yet implemented                   │   │
-│  └─────────────────────────────────────────┘   │
-│                                                 │
-└─────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────┐
+│              Server (Port 4040)                      │
+├──────────────────────────────────────────────────────┤
+│                                                      │
+│  ┌──────────────────────────────────────────────┐   │
+│  │  TCP Acceptor (Boost.Cobalt + Boost.Asio)    │   │
+│  │  - Async connection acceptance               │   │
+│  │  - Coroutine-based per-connection handling   │   │
+│  │  - Thread pool (hardware_concurrency threads)│   │
+│  └──────────────────────────────────────────────┘   │
+│                                                      │
+│  ┌──────────────────────────────────────────────┐   │
+│  │  Chat Rooms (std::list<TCPChatRoom>)         │   │
+│  │  - Named rooms with numeric IDs              │   │
+│  │  - Thread-safe connection vectors            │   │
+│  │  - Channel-based broadcasting               │   │
+│  └──────────────────────────────────────────────┘   │
+│                                                      │
+│  ┌──────────────────────────────────────────────┐   │
+│  │  UDP Multicast Server (Future)               │   │
+│  │  - Not yet implemented                       │   │
+│  └──────────────────────────────────────────────┘   │
+│                                                      │
+└──────────────────────────────────────────────────────┘
          │                    │
          │ TCP Connections    │
          │                    │
@@ -113,148 +102,183 @@ The system accepts the trade-off of reduced reliability (UDP's connectionless na
     └─────────┘         └─────────┘
 ```
 
-### Protocol Design
+### 3.2 Source Layout
 
-The server uses a custom binary protocol over TCP sockets:
+| File | Purpose |
+|---|---|
+| `CMakeLists.txt` | Build configuration (C++26, Boost linkage) |
+| `src/main.cpp` | Entry point — parses `-j<N>`, constructs `Server{4040, 10}`, calls `serve()` |
+| `src/server.hpp` | `Server` class, `TCPChatRoom` struct, type aliases, `Channel` template |
+| `src/server.cpp` | All server logic — accept loop, message parsing, routing, broadcasting |
+| `src/udp_server.hpp` | `UDP_Server` placeholder struct |
+| `src/udp_server.cpp` | `UDP_Server` placeholder (includes header only) |
 
-**Message Format:**
+### 3.3 Key Types
+
+1. **`Server`** — Main server class.
+   - Owns the TCP acceptor, the chat-room list, and an (unused) `UDP_Server`.
+   - `serve(size_t thread_count)` creates a `boost::asio::io_context`, spawns the coroutine tree via `boost::cobalt::spawn`, then runs the context across a `std::jthread` pool.
+   - Handles SIGINT / SIGTERM through `boost::cobalt::io::signal_set` + `boost::cobalt::race`.
+
+2. **`TCPChatRoom`** — Represents a single chat room.
+   - `std::string name` — human-readable room name.
+   - `uint64_t id` — unique numeric room identifier.
+   - `connection_list connections` — `std::vector<std::weak_ptr<Channel<std::string>>>` of subscriber channels.
+   - `std::mutex mutex` — guards the connection list.
+
+3. **`Channel<std::string>`** — `boost::cobalt::channel<std::string>` used for inter-coroutine message passing between the broadcasting coroutine and each subscriber's listener coroutine.
+
+4. **`UDP_Server`** — Empty placeholder struct for future multicast work.
+
+## 4. Protocol Reference
+
+### 4.1 Message Framing
+
+Each message is a **newline-terminated JSON object** (`\n` delimiter). There is no binary length prefix.
+
 ```
-<size: uint64_t> <space> <json_payload>
+<json_object>\n
 ```
 
-**JSON Message Types:**
+### 4.2 Client → Server Messages
 
-1. **Subscribe to Room:**
+#### 4.2.1 `sub` — Subscribe to an existing room
+
 ```json
-{
-  "type": "sub",
-  "grp": 12345
-}
+{"type": "sub", "grp": <room_id>}
 ```
 
-2. **Unsubscribe:**
+| Field | Type | Description |
+|---|---|---|
+| `type` | `string` | `"sub"` |
+| `grp` | `uint64` | Numeric ID of an existing room |
+
+The server looks up the room, creates a `Channel` for this client, and starts a listener coroutine. Returns an error string if the room does not exist or the client is already subscribed.
+
+#### 4.2.2 `csub` — Create a new room and subscribe
+
 ```json
-{
-  "type": "desub"
-}
+{"type": "csub", "grp_name": "<room_name>"}
 ```
 
-3. **Send Message:**
+| Field | Type | Description |
+|---|---|---|
+| `type` | `string` | `"csub"` |
+| `grp_name` | `string` | Human-readable name for the new room |
+
+The server creates the room (assigning the next numeric ID), subscribes the client, and starts a listener coroutine.
+
+#### 4.2.3 `msg` — Send a message to a room
+
 ```json
-{
-  "type": "message",
-  "data": "Hello, world!"
-}
+{"type": "msg", "grp": <room_id>, "msg": "<text>"}
 ```
 
-4. **Broadcast (Server to Client):**
+| Field | Type | Description |
+|---|---|---|
+| `type` | `string` | `"msg"` |
+| `grp` | `uint64` | Numeric ID of a room the client is subscribed to |
+| `msg` | `string` | Message content |
+
+The server verifies the client is subscribed, then fans the message out to every other subscriber's channel in the room via a `boost::cobalt::wait_group`.
+
+#### 4.2.4 `desub` — End session
+
 ```json
-{
-  "type": "message",
-  "data": "User message content"
-}
+{"type": "desub"}
 ```
 
-### Key Components
+| Field | Type | Description |
+|---|---|---|
+| `type` | `string` | `"desub"` |
 
-1. **Server Class** (`server.hpp`, `server.cpp`)
-   - Main server orchestration
-   - TCP acceptor management
-   - Chat room lifecycle management
-   - Message routing and broadcasting
+Immediately closes the client's TCP session (the coroutine returns).
 
-2. **TCPChatRoom Struct**
-   - Room ID (`uint64_t`)
-   - Thread-safe connection vector (weak_ptr to channels)
-   - Mutex for concurrent access protection
+### 4.3 Server → Client Messages
 
-3. **UDP_Server Class** (`udp_server.hpp`, `udp_server.cpp`)
-   - Placeholder for future UDP multicast implementation
+#### 4.3.1 Broadcast
 
-4. **Main Entry Point** (`main.cpp`)
-   - Server initialization (port 4040, max 10 rooms)
-   - Server execution
+When a subscriber's listener coroutine reads from its channel, the server sends:
 
-## Building the Project
-
-### Prerequisites
-- CMake 3.1+
-- C++26-compatible compiler (GCC 14+, Clang 16+, or MSVC 2022+)
-- Boost libraries (1.80+)
-  - Boost.Asio
-  - Boost.JSON
-
-### Build Steps
-
-```bash
-# Create build directory
-mkdir build && cd build
-
-# Configure with CMake
-cmake ..
-
-# Build the project
-cmake --build .
-
-# Run the server
-./udp_multicast_chat_room
+```json
+{"type": "message", "data": "<channel_payload>", "grp_name": "<room_name>"}
 ```
 
-### macOS (Homebrew)
-```bash
-# Install Boost
-brew install boost
+| Field | Type | Description |
+|---|---|---|
+| `type` | `string` | `"message"` |
+| `data` | `string` | The channel payload — a serialized JSON string `{"grp":"<room_name>","message":"<text>"}` |
+| `grp_name` | `string` | Room name |
 
-# Build
-mkdir build && cd build
-cmake ..
-make
-```
+> **Note:** The `data` field contains a JSON-encoded string (the serialized inner object), not the raw message text.
 
-## Running the Server
+#### 4.3.2 Error responses
 
-```bash
-./udp_multicast_chat_room
-```
+On invalid input (bad JSON, unknown type, missing fields, not subscribed, etc.) the server sends a plain-text error string directly over the socket (not JSON-wrapped).
 
-The server will start listening on **port 4040** with a maximum of **10 chat rooms**.
+## 5. Technologies & Libraries
 
-## Future Goals
+### 5.1 Language
 
-### 🎯 Planned Features
+- **C++26** — uses `std::print` / `std::println`, `std::format`, `std::ranges`, coroutines, `std::jthread`, etc.
 
-1. **UDP Multicast Implementation**
-   - Implement automatic upgrade from TCP to UDP multicast
-   - Multicast group management
-   - Hybrid TCP/UDP protocol switching
-   - Reliability layer on top of UDP (optional)
+### 5.2 Core Libraries
 
-2. **Authentication System**
-   - User authentication before room access
-   - Token-based session management
-   - Secure credential handling
-   - Authorization for room creation/access
+1. **Boost.Cobalt** — Primary async / coroutine library.
+   - `boost::cobalt::task`, `boost::cobalt::promise` — coroutine types.
+   - `boost::cobalt::channel` — inter-coroutine communication.
+   - `boost::cobalt::wait_group` — concurrent fan-out.
+   - `boost::cobalt::race` — race multiple async operations.
+   - `boost::cobalt::spawn` — launch a coroutine tree on an `io_context`.
+   - `boost::cobalt::io::signal_set` — async signal handling.
 
-3. **QUIC Integration**
-   - QUIC protocol support with UDP multicast
-   - Improved reliability over standard UDP
-   - Built-in encryption and security
-   - 0-RTT connection establishment
+2. **Boost.Asio** — I/O & networking.
+   - `boost::asio::io_context` — event loop.
+   - `tcp::acceptor`, `tcp::socket` — TCP connection management.
+   - `boost::asio::async_read_until` — newline-delimited reads.
 
-4. **Enhanced Features**
-   - Room creation and deletion APIs
-   - Private/public room modes
-   - User presence notifications
-   - Message history and persistence
-   - Rate limiting and spam prevention
+3. **Boost.JSON** — JSON parsing and serialization.
+   - `boost::json::parse` — parse incoming messages.
+   - `boost::json::serialize` / `boost::json::object` — build outgoing messages.
 
-## Protocol Design Philosophy
+### 5.3 Build System
 
-This project deliberately uses a **custom protocol over raw sockets** rather than HTTP/WebSocket for several reasons:
+- **CMake 3.5+**
+- C++26 standard — `set(CMAKE_CXX_STANDARD 26)`
+- Boost include/lib from `/usr/local/boost/`
+- Links `boost_json` and `boost_cobalt`
+- `CMAKE_EXPORT_COMPILE_COMMANDS ON` for IDE integration
 
-1. **Performance**: Reduced overhead compared to HTTP
-2. **Control**: Full control over message framing and protocol semantics
-3. **Multicast Ready**: Easier integration with UDP multicast (no WebSocket overhead)
-4. **Learning**: Educational value in understanding low-level networking
+## 6. Implementation Status
 
-**Note**: This is an active development project. The UDP multicast functionality is the next major milestone.
+### 6.1 Completed
+
+1. **Multithreaded TCP server** — async accept loop, coroutine-per-connection, `std::jthread` pool (default `hardware_concurrency`, override with `-j<N>`).
+2. **Graceful shutdown** — SIGINT / SIGTERM via `boost::cobalt::io::signal_set` + `boost::cobalt::race`.
+3. **Named chat rooms** — created on demand (`csub`), looked up by numeric ID (`sub`, `msg`), stored in a `std::list<TCPChatRoom>` guarded by `std::mutex`.
+4. **Newline-delimited JSON protocol** — four client message types (`sub`, `csub`, `msg`, `desub`) and one server broadcast type.
+5. **Channel-based broadcasting** — per-subscriber `boost::cobalt::channel<std::string>`, fan-out via `boost::cobalt::wait_group`, stale subscriber cleanup with `weak_ptr`.
+
+### 6.2 In Progress
+
+1. **UDP multicast** — `UDP_Server` struct exists but is empty; no multicast logic yet.
+
+## 7. Future Goals
+
+1. **UDP Multicast** — automatic upgrade from TCP to multicast, group management, hybrid TCP/UDP switching, optional reliability layer.
+2. **Authentication** — user auth before room access, token-based sessions, secure credential handling, authorization for room creation.
+3. **QUIC Integration** — QUIC protocol support alongside UDP multicast, built-in encryption, 0-RTT connection establishment.
+4. **Enhanced Features** — room deletion, private/public modes, presence notifications, message history, rate limiting.
+
+## 8. Design Philosophy
+
+This project deliberately uses a **custom protocol over raw sockets** rather than HTTP/WebSocket:
+
+1. **Performance** — minimal overhead compared to HTTP.
+2. **Control** — full control over message framing and protocol semantics.
+3. **Multicast Ready** — no WebSocket layer to bypass when upgrading to UDP multicast.
+4. **Learning** — educational value in understanding low-level networking.
+
+---
+
+**Note:** This is an active development project. UDP multicast is the next major milestone.
