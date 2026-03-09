@@ -1,0 +1,12 @@
+[application]
+name = "Multicast Chat"
+
+[web.app]
+title = "Multicast Chat"
+
+[web.resource]
+style = []
+script = []
+
+[web.resource.dev]
+script = []
