@@ -1,13 +1,13 @@
-
 #pragma once
 
 #include "udp_chat_room.hpp"
 #include <boost/asio.hpp>
-#include <boost/cobalt.hpp>
+#include <list>
 #include <mutex>
+
 using boost::asio::ip::tcp;
 using boost::asio::ip::udp;
-using tcp_socket = boost::cobalt::use_op_t::as_default_on_t<tcp::socket>;
+using tcp_socket = boost::asio::use_awaitable_t<>::as_default_on_t<tcp::socket>;
 
 struct UDP_Server {
 private:

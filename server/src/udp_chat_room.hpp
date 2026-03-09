@@ -1,3 +1,5 @@
+#pragma once
+
 #include "tcp_chat_room.hpp"
 
 struct UDPChatRoom {

@@ -1,11 +1,10 @@
-
 #pragma once
-#include "boost/cobalt.hpp"
+
+#include "channel.hpp"
 #include <memory>
 #include <mutex>
+#include <string>
 #include <vector>
-
-template <typename Message> using Channel = boost::cobalt::channel<Message>;
 
 struct TCPChatRoom {
   using connection_list = std::vector<std::weak_ptr<Channel<std::string>>>;
