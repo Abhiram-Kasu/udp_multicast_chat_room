@@ -1,0 +1,17 @@
+[package]
+name = "ui"
+version = "0.1.0"
+authors = ["Abhiram Kasu <abhiram.kasu@gmail.com>"]
+edition = "2021"
+
+[dependencies]
+dioxus = { version = "0.7.1", features = [] }
+tokio = { version = "1", features = ["net", "io-util", "sync", "rt", "macros", "time"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[features]
+default = ["desktop"]
+web = ["dioxus/web"]
+desktop = ["dioxus/desktop"]
+mobile = ["dioxus/mobile"]
