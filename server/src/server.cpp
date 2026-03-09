@@ -162,16 +162,16 @@ boost::asio::awaitable<void> Server::accept_connections() {
   }
 }
 
-boost::asio::awaitable<std::vector<char>> Server::parse_data(tcp_socket &s) {
+boost::asio::awaitable<std::vector<char>>
+Server::parse_data(tcp_socket &s, boost::asio::streambuf &buf) {
   println("parse_data: waiting for newline-delimited payload");
-  auto mutable_buffer = boost::asio::streambuf();
 
   auto bytes_read = co_await boost::asio::async_read_until(
-      s, mutable_buffer, '\n', boost::asio::use_awaitable);
+      s, buf, '\n', boost::asio::use_awaitable);
   println("parse_data: read {} bytes, streambuf size = {}", bytes_read,
-          mutable_buffer.size());
+          buf.size());
 
-  std::istream response_stream(&mutable_buffer);
+  std::istream response_stream(&buf);
   std::string data_str(bytes_read, '\0');
   response_stream.read(data_str.data(), bytes_read);
 
@@ -205,10 +205,28 @@ boost::asio::awaitable<void> Server::tcp_accept(tcp_socket s) {
   println("tcp_accept: session started");
   auto exec = co_await boost::asio::this_coro::executor;
   auto current_subscriptions = std::map<TCPChatRoom *, subscription>{};
+  auto read_buf = boost::asio::streambuf{};
+
+  auto write_chan = std::make_shared<Channel<std::string>>(exec);
+
+  boost::asio::co_spawn(
+      exec,
+      [&s, wc = write_chan]() -> boost::asio::awaitable<void> {
+        co_await Server::socket_writer(s, wc);
+      },
+      boost::asio::detached);
+
+  auto cleanup = [&]() {
+    for (auto &[room, sub] : current_subscriptions) {
+      sub.first->close();
+    }
+    write_chan->close();
+  };
+
   for (;;) {
     try {
       println("tcp_accept: waiting for next message");
-      const auto data = co_await parse_data(s);
+      const auto data = co_await parse_data(s, read_buf);
       println("tcp_accept: received raw data ({} bytes): {}", data.size(),
               std::string_view{data.begin(), data.end()});
 
@@ -232,13 +250,13 @@ boost::asio::awaitable<void> Server::tcp_accept(tcp_socket s) {
       if (error_code.failed()) {
         println("tcp_accept: failed to parse JSON: {} (error code: {})",
                 error_code.message(), error_code.value());
-        co_await s.async_send(boost::asio::buffer("Failed to parse JSON: " +
-                                                  error_code.message()));
+        write_chan->write("Failed to parse JSON: " + error_code.message() +
+                          "\n");
         continue;
       }
       if (!parsed.is_object()) {
         println("tcp_accept: invalid JSON (not an object)");
-        co_await s.async_send(boost::asio::buffer("Invalid JSON"));
+        write_chan->write("Invalid JSON\n");
         continue;
       }
 
@@ -264,26 +282,32 @@ boost::asio::awaitable<void> Server::tcp_accept(tcp_socket s) {
               auto *cr = chat_room;
               boost::asio::co_spawn(
                   exec,
-                  [this, &s, weak_chan, cr]() -> boost::asio::awaitable<void> {
-                    co_await spawn_listener(s, weak_chan, cr);
+                  [wc = write_chan, weak_chan,
+                   cr]() -> boost::asio::awaitable<void> {
+                    co_await Server::spawn_listener(wc, weak_chan, cr);
                   },
                   boost::asio::detached);
 
+              auto chan_copy = channel;
               current_subscriptions.emplace(
-                  chat_room, std::make_pair(channel, std::move(channel)));
+                  chat_room, subscription{chan_copy, std::move(chan_copy)});
               println("tcp_accept: subscribed to room id={} name={}",
                       chat_room->id, chat_room->name);
+
+              auto reply = boost::json::serialize(
+                  boost::json::object{{"type", "sub_ok"},
+                                      {"grp", chat_room->id},
+                                      {"grp_name", chat_room->name}});
+              reply += '\n';
+              write_chan->write(std::move(reply));
             } else {
               auto error = std::get<std::string_view>(result);
               println("tcp_accept: sub failed: {}", error);
-              co_await s.async_send(
-                  boost::asio::buffer(std::format("Failed: {}", error)));
+              write_chan->write(std::format("Failed: {}\n", error));
             }
           } else if (value == "desub") {
             println("tcp_accept: desub request received, ending session");
-            for (auto &[room, sub] : current_subscriptions) {
-              sub.first->close();
-            }
+            cleanup();
             co_return;
           } else if (value == "csub") {
             println("tcp_accept: handling create+sub request");
@@ -297,20 +321,29 @@ boost::asio::awaitable<void> Server::tcp_accept(tcp_socket s) {
               auto *cr = chat_room;
               boost::asio::co_spawn(
                   exec,
-                  [this, &s, weak_chan, cr]() -> boost::asio::awaitable<void> {
-                    co_await spawn_listener(s, weak_chan, cr);
+                  [wc = write_chan, weak_chan,
+                   cr]() -> boost::asio::awaitable<void> {
+                    co_await Server::spawn_listener(wc, weak_chan, cr);
                   },
                   boost::asio::detached);
 
+              auto chan_copy = channel;
               current_subscriptions.emplace(
-                  chat_room, std::make_pair(channel, std::move(channel)));
+                  chat_room, subscription{chan_copy, std::move(chan_copy)});
               println("tcp_accept: created+subscribed room id={} name={}",
                       chat_room->id, chat_room->name);
+
+              auto reply = boost::json::serialize(
+                  boost::json::object{{"type", "csub_ok"},
+                                      {"grp", chat_room->id},
+                                      {"grp_name", chat_room->name}});
+              reply += '\n';
+              write_chan->write(std::move(reply));
             } else {
               auto error = std::get<std::string_view>(result);
               println("tcp_accept: create+sub failed: {}", error);
-              co_await s.async_send(boost::asio::buffer(
-                  std::format("Failed to create and subscribe: {}", error)));
+              write_chan->write(
+                  std::format("Failed to create and subscribe: {}\n", error));
             }
 
           } else if (value == "msg") {
@@ -323,8 +356,7 @@ boost::asio::awaitable<void> Server::tcp_accept(tcp_socket s) {
 
               if (not current_subscriptions.contains(chat_room)) {
                 println("tcp_accept: message rejected (not subscribed)");
-                co_await s.async_send(
-                    boost::asio::buffer("not subscribed to this room\n"));
+                write_chan->write("not subscribed to this room\n");
                 continue;
               }
 
@@ -343,9 +375,7 @@ boost::asio::awaitable<void> Server::tcp_accept(tcp_socket s) {
               for (const auto &connection : chat_room->connections) {
                 auto locked = connection.lock();
                 if (locked && locked != curr_chan) {
-                  auto res = boost::json::serialize(boost::json::object{
-                      {"grp", chat_room->name}, {"message", message}});
-                  locked->write(std::string{res.c_str()});
+                  locked->write(std::string{message});
                 }
               }
 
@@ -353,21 +383,20 @@ boost::asio::awaitable<void> Server::tcp_accept(tcp_socket s) {
             } else {
               auto error = std::get<std::string_view>(msg_result);
               println("tcp_accept: message parse error: {}", error);
-              co_await s.async_send(boost::asio::buffer(
-                  std::format("Failed to send msg: {}", error)));
+              write_chan->write(std::format("Failed to send msg: {}\n", error));
             }
 
           } else {
             println("tcp_accept: Invalid JSON (unknown type)");
-            co_await s.async_send(boost::asio::buffer("Invalid JSON"));
+            write_chan->write("Invalid JSON\n");
           }
         } else {
           println("tcp_accept: type field is not a string");
-          co_await s.async_send(boost::asio::buffer("Invalid JSON"));
+          write_chan->write("Invalid JSON\n");
         }
       } else {
         println("tcp_accept: missing type field");
-        co_await s.async_send(boost::asio::buffer("Invalid JSON"));
+        write_chan->write("Invalid JSON\n");
       }
     } catch (const boost::system::system_error &err) {
       if (err.code() == boost::asio::error::eof ||
@@ -377,15 +406,11 @@ boost::asio::awaitable<void> Server::tcp_accept(tcp_socket s) {
       } else {
         println("tcp_accept: error: {}", err.code().message());
       }
-      for (auto &[room, sub] : current_subscriptions) {
-        sub.first->close();
-      }
+      cleanup();
       co_return;
     } catch (const std::exception &err) {
       println("tcp_accept: unexpected error: {}", err.what());
-      for (auto &[room, sub] : current_subscriptions) {
-        sub.first->close();
-      }
+      cleanup();
       co_return;
     }
   }
@@ -490,23 +515,48 @@ std::optional<TCPChatRoom *> Server::try_find_room(uint64_t room_id) {
 }
 
 boost::asio::awaitable<void>
-Server::spawn_listener(tcp_socket &socket,
-                       std::weak_ptr<Channel<std::string>> chan,
+Server::socket_writer(tcp_socket &s,
+                      std::shared_ptr<Channel<std::string>> write_chan) {
+  println("socket_writer: started");
+  while (write_chan->is_open() || true) {
+    try {
+      auto data = co_await write_chan->async_read();
+      println("socket_writer: sending {} bytes", data.size());
+      co_await s.async_send(boost::asio::buffer(data));
+    } catch (const boost::system::system_error &err) {
+      if (err.code() == boost::asio::error::operation_aborted) {
+        println("socket_writer: channel closed, exiting");
+      } else {
+        println("socket_writer: error: {}", err.code().message());
+      }
+      break;
+    } catch (const std::exception &err) {
+      println("socket_writer: unexpected error: {}", err.what());
+      break;
+    }
+  }
+  println("socket_writer: exiting");
+}
+
+boost::asio::awaitable<void>
+Server::spawn_listener(std::shared_ptr<Channel<std::string>> write_chan,
+                       std::weak_ptr<Channel<std::string>> read_chan,
                        TCPChatRoom *chat_room) {
   println("spawn_listener: started for room id={} name={}", chat_room->id,
           chat_room->name);
-  while (not chan.expired()) {
-    auto locked = chan.lock();
-    if (!locked || !locked->is_open() || !socket.is_open()) {
+  while (not read_chan.expired()) {
+    auto locked = read_chan.lock();
+    if (!locked || !locked->is_open()) {
       break;
     }
     try {
       auto data = co_await locked->async_read();
-      println("spawn_listener: room id={} sending message ({} bytes)",
+      println("spawn_listener: room id={} forwarding message ({} bytes)",
               chat_room->id, data.size());
       auto json_str = boost::json::serialize(boost::json::object{
           {"type", "message"}, {"data", data}, {"grp_name", chat_room->name}});
-      co_await socket.async_send(boost::asio::buffer(json_str));
+      json_str += '\n';
+      write_chan->write(std::move(json_str));
     } catch (const boost::system::system_error &err) {
       if (err.code() == boost::asio::error::eof ||
           err.code() == boost::asio::error::connection_reset ||

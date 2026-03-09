@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.5)
-set(CMAKE_CXX_STANDARD 26)
+set(CMAKE_CXX_STANDARD 20)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
@@ -17,5 +17,5 @@ add_executable(udp_multicast_chat_room ${SRC_LIST})
 
 target_include_directories(udp_multicast_chat_room PRIVATE /usr/local/boost/include)
 target_link_directories(udp_multicast_chat_room PRIVATE /usr/local/boost/lib)
-target_link_libraries(udp_multicast_chat_room PRIVATE boost_json boost_cobalt boost_cobalt_io)
+target_link_libraries(udp_multicast_chat_room PRIVATE boost_json)
 target_compile_definitions(udp_multicast_chat_room PRIVATE BOOST_ERROR_CODE_HEADER_ONLY=1)
