@@ -8,6 +8,7 @@
 #include <boost/json/parse.hpp>
 #include <boost/json/serialize.hpp>
 #include <cstdint>
+#include <expected>
 #include <list>
 #include <map>
 #include <memory>
@@ -20,10 +21,6 @@ using boost::asio::ip::udp;
 using tcp_acceptor =
     boost::asio::use_awaitable_t<>::as_default_on_t<tcp::acceptor>;
 using tcp_socket = boost::asio::use_awaitable_t<>::as_default_on_t<tcp::socket>;
-
-template <class... Ts> struct overloads : Ts... {
-  using Ts::operator()...;
-};
 
 struct Server {
 private:
@@ -48,7 +45,7 @@ private:
   using subscription = std::pair<std::shared_ptr<Channel<std::string>>,
                                  std::shared_ptr<Channel<std::string>>>;
 
-  boost::asio::awaitable<std::variant<
+  boost::asio::awaitable<std::expected<
       std::pair<std::shared_ptr<Channel<std::string>>, TCPChatRoom *>,
       std::string_view>>
   handle_sub(boost::json::object &,
@@ -64,7 +61,7 @@ private:
 
   std::optional<TCPChatRoom *> try_find_room(uint64_t room_id);
 
-  boost::asio::awaitable<std::variant<
+  boost::asio::awaitable<std::expected<
       std::pair<std::shared_ptr<Channel<std::string>>, TCPChatRoom *>,
       std::string_view>>
   handle_create_and_sub(boost::json::object &);
@@ -78,7 +75,7 @@ private:
 
   using Message = std::pair<std::string_view, TCPChatRoom *>;
   auto parse_message(boost::json::object &data)
-      -> std::variant<Message, std::string_view>;
+      -> std::expected<Message, std::string_view>;
 
   auto parse_id(boost::json::object &data, std::string_view key)
       -> std::optional<uint64_t>;
